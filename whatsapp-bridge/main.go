@@ -46,6 +46,81 @@ type MessageStore struct {
 	db *sql.DB
 }
 
+const (
+	ollamaURL   = "http://localhost:11434/api/chat"
+	ollamaModel = "gpt-oss:120b-cloud" // match a model you've pulled: `ollama list`
+	fallbackMsg = "Good morning"
+)
+
+type ollamaMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type ollamaRequest struct {
+	Model    string          `json:"model"`
+	Stream   bool            `json:"stream"`
+	Messages []ollamaMessage `json:"messages"`
+}
+
+type ollamaResponse struct {
+	Message ollamaMessage `json:"message"`
+}
+
+// generateReply asks the local Ollama model to compose a reply to an incoming
+// WhatsApp message. Returns fallbackMsg on any error/timeout so callers always
+// get something sendable.
+func generateReply(incoming string) string {
+	reqBody := ollamaRequest{
+		Model:  ollamaModel,
+		Stream: false,
+		Messages: []ollamaMessage{
+			{
+				Role: "system",
+				Content: "You reply to WhatsApp messages on my behalf. " +
+					"Keep replies short, friendly, and natural — one or two sentences, no preamble.",
+			},
+			{Role: "user", Content: incoming},
+		},
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return fallbackMsg
+	}
+
+	// First call loads the model into memory, so allow generous time.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ollamaURL, bytes.NewReader(payload))
+	if err != nil {
+		return fallbackMsg
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fallbackMsg
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fallbackMsg
+	}
+
+	var out ollamaResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fallbackMsg
+	}
+
+	reply := out.Message.Content
+	if reply == "" {
+		return fallbackMsg
+	}
+	return reply
+}
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
@@ -471,14 +546,15 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Auto-reply to incoming text messages
 	if !msg.Info.IsFromMe && content != "" && mediaType == "" {
-		go func(recipient string) {
-			success, replyMsg := sendWhatsAppMessage(client, recipient, "Good morning", "")
+		go func(recipient, incoming string) {
+			reply := generateReply(incoming)
+			success, replyMsg := sendWhatsAppMessage(client, recipient, reply, "")
 			if success {
-				logger.Infof("Auto-replied to %s: Good morning", recipient)
+				logger.Infof("Auto-replied to %s: %s", recipient, reply)
 			} else {
 				logger.Warnf("Failed to auto-reply to %s: %s", recipient, replyMsg)
 			}
-		}(chatJID)
+		}(chatJID, content)
 	}
 }
 
