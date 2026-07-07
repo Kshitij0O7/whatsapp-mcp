@@ -49,8 +49,29 @@ type MessageStore struct {
 const (
 	ollamaURL   = "http://localhost:11434/api/chat"
 	ollamaModel = "gpt-oss:120b-cloud" // match a model you've pulled: `ollama list`
-	fallbackMsg = "Good morning"
 )
+
+// systemPersona defines how the assistant behaves. The SolarTechy knowledge base
+// (loaded from the markdown files at startup) is appended to this to form the full
+// system prompt. See docs/solartechy-assistant-plan.md.
+const systemPersona = `You are a SolarTechy Sales & Support Executive replying to customers on WhatsApp. You are NOT a generic chatbot — sound like a friendly, professional, honest and concise solar engineer helping a customer.
+
+Answer using ONLY the SolarTechy knowledge base provided below.
+- Never invent or guess information (pricing, features, policies, contact details, dates).
+- If the answer is not in the knowledge base, do not make one up. Instead, acknowledge the question and tell the customer you've noted it and the SolarTechy team will get back to them shortly.
+- Keep replies short and WhatsApp-friendly: 1-4 short sentences, minimal formatting, emojis only occasionally.
+
+Collect customer information gradually and naturally:
+- Ask for at most ONE detail at a time, only when it fits the conversation.
+- Do not ask for personal details in the first message unless it is required to help (for example, booking a demo).
+- Never re-ask for information the customer has already provided earlier in the conversation.
+
+Decide whether a reply is even needed:
+- If the customer's latest message is only an acknowledgement (for example "ok", "thanks", "great", "done", or just an emoji), or the conversation has clearly ended, or a reply would add no value, then do not reply.
+- Otherwise, reply helpfully.
+
+You MUST respond with a single JSON object and nothing else, in exactly this shape:
+{"shouldReply": <true|false>, "reply": "<your message, or an empty string if shouldReply is false>"}`
 
 type ollamaMessage struct {
 	Role    string `json:"role"`
@@ -60,6 +81,7 @@ type ollamaMessage struct {
 type ollamaRequest struct {
 	Model    string          `json:"model"`
 	Stream   bool            `json:"stream"`
+	Format   string          `json:"format,omitempty"`
 	Messages []ollamaMessage `json:"messages"`
 }
 
@@ -67,26 +89,99 @@ type ollamaResponse struct {
 	Message ollamaMessage `json:"message"`
 }
 
-// generateReply asks the local Ollama model to compose a reply to an incoming
-// WhatsApp message. Returns fallbackMsg on any error/timeout so callers always
-// get something sendable.
-func generateReply(incoming string) string {
+// assistantResponse is the structured decision returned by the model: whether to
+// reply at all, and the reply text.
+type assistantResponse struct {
+	ShouldReply bool   `json:"shouldReply"`
+	Reply       string `json:"reply"`
+}
+
+// knowledgeBase holds the concatenated SolarTechy markdown knowledge files. It is
+// populated once at startup by loadKnowledgeBase.
+var knowledgeBase string
+
+// pgStore, when non-nil, mirrors conversations and customer context to Postgres for
+// durable, remotely-accessible storage. It is enabled by setting DATABASE_URL.
+var pgStore *PGStore
+
+// loadKnowledgeBase reads every .md file in dir and concatenates them (each prefixed
+// with its filename) into a single string for use as product context.
+func loadKnowledgeBase(dir string) (content string, fileCount int, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", 0, err
+	}
+
+	var sb strings.Builder
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if readErr != nil {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("\n\n===== FILE: %s =====\n", entry.Name()))
+		sb.Write(data)
+		fileCount++
+	}
+
+	return sb.String(), fileCount, nil
+}
+
+// buildSystemPrompt combines the executive persona with the loaded knowledge base.
+func buildSystemPrompt() string {
+	return systemPersona + "\n\n===== SOLARTECHY KNOWLEDGE BASE =====\n" + knowledgeBase
+}
+
+// buildConversationHistory loads the most recent messages for a chat and converts
+// them to Ollama chat messages in chronological order (oldest first).
+func buildConversationHistory(store *MessageStore, chatJID string, limit int) []ollamaMessage {
+	msgs, err := store.GetMessages(chatJID, limit)
+	if err != nil {
+		return nil
+	}
+
+	history := make([]ollamaMessage, 0, len(msgs))
+	// GetMessages returns newest-first; iterate in reverse for chronological order.
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		text := m.Content
+		if text == "" {
+			if m.MediaType != "" {
+				text = fmt.Sprintf("[customer sent a %s]", m.MediaType)
+			} else {
+				continue
+			}
+		}
+		role := "user"
+		if m.IsFromMe {
+			role = "assistant"
+		}
+		history = append(history, ollamaMessage{Role: role, Content: text})
+	}
+	return history
+}
+
+// generateReply asks the local Ollama model, acting as the SolarTechy executive, to
+// decide whether/how to respond given the recent conversation history (oldest first).
+// It returns (shouldReply, replyText). On any error it returns (false, "") so the
+// caller stays silent rather than sending a low-quality message.
+func generateReply(history []ollamaMessage) (bool, string) {
+	messages := make([]ollamaMessage, 0, len(history)+1)
+	messages = append(messages, ollamaMessage{Role: "system", Content: buildSystemPrompt()})
+	messages = append(messages, history...)
+
 	reqBody := ollamaRequest{
-		Model:  ollamaModel,
-		Stream: false,
-		Messages: []ollamaMessage{
-			{
-				Role: "system",
-				Content: "You reply to WhatsApp messages on my behalf. " +
-					"Keep replies short, friendly, and natural — one or two sentences, no preamble.",
-			},
-			{Role: "user", Content: incoming},
-		},
+		Model:    ollamaModel,
+		Stream:   false,
+		Format:   "json",
+		Messages: messages,
 	}
 
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
-		return fallbackMsg
+		return false, ""
 	}
 
 	// First call loads the model into memory, so allow generous time.
@@ -95,30 +190,36 @@ func generateReply(incoming string) string {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ollamaURL, bytes.NewReader(payload))
 	if err != nil {
-		return fallbackMsg
+		return false, ""
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fallbackMsg
+		return false, ""
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fallbackMsg
+		return false, ""
 	}
 
 	var out ollamaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return fallbackMsg
+		return false, ""
 	}
 
-	reply := out.Message.Content
-	if reply == "" {
-		return fallbackMsg
+	// The model is asked to return a JSON object; parse the assistant's decision.
+	var decision assistantResponse
+	if err := json.Unmarshal([]byte(out.Message.Content), &decision); err != nil {
+		// Not valid JSON — stay silent rather than send raw model output.
+		return false, ""
 	}
-	return reply
+
+	if !decision.ShouldReply {
+		return false, ""
+	}
+	return true, strings.TrimSpace(decision.Reply)
 }
 
 // Initialize message store
@@ -544,17 +645,61 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
-	// Auto-reply to incoming text messages
-	if !msg.Info.IsFromMe && content != "" && mediaType == "" {
-		go func(recipient, incoming string) {
-			reply := generateReply(incoming)
+	isGroup := strings.HasSuffix(chatJID, "@g.us")
+
+	// Mirror inbound 1:1 customer text messages to Postgres (if enabled).
+	if pgStore != nil && !msg.Info.IsFromMe && content != "" && !isGroup {
+		if err := pgStore.UpsertCustomer(chatJID, sender, name); err != nil {
+			logger.Warnf("Postgres: failed to upsert customer %s: %v", chatJID, err)
+		}
+		if err := pgStore.SaveMessage(chatJID, "customer", content, msg.Info.ID); err != nil {
+			logger.Warnf("Postgres: failed to save inbound message for %s: %v", chatJID, err)
+		}
+	}
+
+	// Auto-reply as the SolarTechy executive to incoming 1:1 text messages.
+	// The incoming message is already stored above, so it is included in the history.
+	if !msg.Info.IsFromMe && content != "" && mediaType == "" && !isGroup {
+		go func(recipient string) {
+			history := buildConversationHistory(messageStore, recipient, 15)
+			shouldReply, reply := generateReply(history)
+			if !shouldReply || reply == "" {
+				logger.Infof("Assistant chose not to reply to %s", recipient)
+				return
+			}
 			success, replyMsg := sendWhatsAppMessage(client, recipient, reply, "")
 			if success {
+				// Persist the assistant's own reply. whatsmeow does not echo
+				// self-sent messages back as events, so without this the stored
+				// history is one-sided (only the customer's messages) and the model
+				// re-introduces itself every turn. Storing it makes future turns
+				// context-aware.
+				senderID := ""
+				if client.Store.ID != nil {
+					senderID = client.Store.ID.User
+				}
+				if storeErr := messageStore.StoreMessage(
+					fmt.Sprintf("assistant-%d", time.Now().UnixNano()),
+					recipient,
+					senderID,
+					reply,
+					time.Now(),
+					true, // is_from_me
+					"", "", "", nil, nil, nil, 0,
+				); storeErr != nil {
+					logger.Warnf("Failed to store assistant reply for %s: %v", recipient, storeErr)
+				}
+				// Mirror the assistant reply to Postgres (if enabled).
+				if pgStore != nil {
+					if pgErr := pgStore.SaveMessage(recipient, "assistant", reply, ""); pgErr != nil {
+						logger.Warnf("Postgres: failed to save assistant reply for %s: %v", recipient, pgErr)
+					}
+				}
 				logger.Infof("Auto-replied to %s: %s", recipient, reply)
 			} else {
 				logger.Warnf("Failed to auto-reply to %s: %s", recipient, replyMsg)
 			}
-		}(chatJID, content)
+		}(chatJID)
 	}
 }
 
@@ -921,6 +1066,32 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+
+	// Load the SolarTechy knowledge base used by the assistant persona.
+	kbDir := os.Getenv("SOLARTECHY_KB_DIR")
+	if kbDir == "" {
+		kbDir = "../assistant/knowledge"
+	}
+	if kb, kbCount, kbErr := loadKnowledgeBase(kbDir); kbErr != nil {
+		logger.Warnf("Could not load knowledge base from %s: %v — assistant will reply with no product context", kbDir, kbErr)
+	} else {
+		knowledgeBase = kb
+		logger.Infof("Loaded %d knowledge base file(s) from %s (%d bytes)", kbCount, kbDir, len(kb))
+	}
+
+	// Optionally connect to Postgres for durable, remotely-accessible conversation
+	// and customer-context storage. Disabled (no-op) when DATABASE_URL is unset.
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		if pg, pgErr := NewPGStore(dbURL); pgErr != nil {
+			logger.Warnf("Postgres disabled: %v", pgErr)
+		} else {
+			pgStore = pg
+			defer pgStore.Close()
+			logger.Infof("Connected to Postgres for conversation/context storage")
+		}
+	} else {
+		logger.Infof("DATABASE_URL not set — Postgres storage disabled (SQLite only)")
+	}
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
