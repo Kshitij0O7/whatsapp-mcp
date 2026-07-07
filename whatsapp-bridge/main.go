@@ -46,10 +46,20 @@ type MessageStore struct {
 	db *sql.DB
 }
 
-const (
-	ollamaURL   = "http://localhost:11434/api/chat"
-	ollamaModel = "gpt-oss:120b-cloud" // match a model you've pulled: `ollama list`
+// ollamaURL and ollamaModel are configurable via env for deployment and fall back
+// to local defaults for development.
+var (
+	ollamaURL   = envOr("OLLAMA_URL", "http://localhost:11434/api/chat")
+	ollamaModel = envOr("OLLAMA_MODEL", "gpt-oss:120b-cloud")
 )
+
+// envOr returns the value of environment variable key, or def when it is unset/empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 // systemPersona defines how the assistant behaves. The SolarTechy knowledge base
 // (loaded from the markdown files at startup) is appended to this to form the full

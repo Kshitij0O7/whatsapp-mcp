@@ -1,0 +1,7 @@
+.git/
+**/store/
+**/__pycache__/
+whatsapp-mcp-server/.venv/
+*.db
+*.log
+example-use.png

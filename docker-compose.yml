@@ -1,0 +1,56 @@
+# SolarTechy WhatsApp assistant — deployment stack.
+#
+# First run (to pair the phone via QR):   docker compose up --build
+#   → watch the logs, scan the QR with WhatsApp, then Ctrl+C.
+# Normal run:                             docker compose up -d --build
+#
+# Configure secrets in a .env file next to this one (see DEPLOY.md).
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: solartechy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: solartechy
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Auto-applies the schema on first initialization of an empty data volume.
+      - ./assistant/db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U solartechy -d solartechy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Bound to loopback only: NOT reachable from the internet, but available on the
+    # VM host — reach it remotely through an SSH tunnel (see DEPLOY.md).
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  bridge:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://solartechy:${POSTGRES_PASSWORD}@postgres:5432/solartechy?sslmode=disable
+      # Point at your Ollama endpoint. On a Linux host running Ollama, use
+      # host.docker.internal together with the extra_hosts mapping below.
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434/api/chat}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:120b-cloud}
+      SOLARTECHY_KB_DIR: /app/assistant/knowledge
+    volumes:
+      # WhatsApp session + SQLite. MUST persist across restarts or you re-scan the QR.
+      - wa_store:/app/store
+    # Needed so the QR code is visible/scannable on first run.
+    stdin_open: true
+    tty: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # The internal REST API (8080) is intentionally NOT published to the host.
+
+volumes:
+  pgdata:
+  wa_store:
